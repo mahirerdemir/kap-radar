@@ -1,8 +1,7 @@
 """
 scanner.py — GitHub Actions'ta çalışan KAP tarayıcı
 Google News RSS üzerinden KAP haberlerini takip eder.
-KAP'ın kendi sitesi GitHub IP'lerini engellediği için
-Google News RSS alternatif kaynak olarak kullanılır.
+48 saatten eski haberler otomatik elenir.
 """
 
 import os
@@ -11,7 +10,8 @@ import hashlib
 import logging
 import requests
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from html import unescape
 import re
 
@@ -36,6 +36,7 @@ KATALIZ_ESIK  = 70
 HEDEF_GETIRI  = 35.0
 STOP_LOSS     = 10.0
 MAX_SURE_SAAT = 48
+MAX_HABER_YAS_SAAT = 48  # Bu kadar saatten eski haberler elenir
 
 POZITIF = [
     "sözleşme", "sozlesme", "anlaşma", "anlasma", "mukavele",
@@ -51,7 +52,6 @@ NEGATIF = [
     "sermaye artırımı", "hisse geri alım", "finansal rapor",
 ]
 
-# Google News RSS sorgu listeleri — KAP haberleri için
 RSS_SORGULAR = [
     "KAP+sözleşme+BIST",
     "KAP+anlaşma+borsa",
@@ -72,15 +72,35 @@ def kaydet_json(yol, veri):
         json.dump(veri, f, ensure_ascii=False, indent=2)
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Tarih Kontrolü
+# ─────────────────────────────────────────────────────────────────────────────
+
+def haber_taze_mi(tarih_str: str) -> bool:
+    """48 saatten yeni mi? Bilinmiyorsa True döner (güvenli taraf)."""
+    if not tarih_str:
+        return True
+    try:
+        haber_tarihi = parsedate_to_datetime(tarih_str)
+        # Timezone-aware karşılaştırma
+        simdi = datetime.now(timezone.utc)
+        haber_tarihi = haber_tarihi.astimezone(timezone.utc)
+        fark_saat = (simdi - haber_tarihi).total_seconds() / 3600
+        if fark_saat > MAX_HABER_YAS_SAAT:
+            log.info(f"  ⏭ Eski haber atlandı ({int(fark_saat)} saat önce)")
+            return False
+        return True
+    except Exception as e:
+        log.warning(f"Tarih parse hatası: {e} — haber kabul edildi")
+        return True
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Google News RSS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def google_news_cek(sorgu: str) -> list:
     url = f"https://news.google.com/rss/search?q={sorgu}&hl=tr&gl=TR&ceid=TR:tr"
     haberler = []
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; FeedFetcher-Google)"
-    }
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; FeedFetcher-Google)"}
     try:
         r = requests.get(url, headers=headers, timeout=15)
         log.info(f"RSS sorgu '{sorgu}': status={r.status_code}, uzunluk={len(r.text)}")
@@ -95,10 +115,7 @@ def google_news_cek(sorgu: str) -> list:
             tarih  = item.findtext("pubDate") or ""
             kaynak = item.findtext("source") or ""
 
-            # HTML taglarını temizle
             baslik = unescape(re.sub(r'<[^>]+>', '', baslik))
-
-            # Benzersiz ID üret
             hid = hashlib.md5(link.encode("utf-8")).hexdigest()[:12]
 
             haberler.append({
@@ -120,15 +137,11 @@ def google_news_cek(sorgu: str) -> list:
 def tum_haberleri_cek() -> list:
     tum = []
     gorulmus_basliklar = set()
-
     for sorgu in RSS_SORGULAR:
-        haberler = google_news_cek(sorgu)
-        for h in haberler:
-            # Duplicate başlık kontrolü
+        for h in google_news_cek(sorgu):
             if h["baslik"] not in gorulmus_basliklar:
                 gorulmus_basliklar.add(h["baslik"])
                 tum.append(h)
-
     log.info(f"Toplam benzersiz haber: {len(tum)}")
     return tum
 
@@ -136,17 +149,27 @@ def tum_haberleri_cek() -> list:
 #  Filtre
 # ─────────────────────────────────────────────────────────────────────────────
 
-def on_filtre(baslik: str) -> bool:
+def on_filtre(baslik: str, tarih_str: str = "") -> bool:
+    # 1. Tarih kontrolü — eski haberler anında elenir
+    if not haber_taze_mi(tarih_str):
+        return False
+
     metin = baslik.lower()
+
+    # 2. Negatif filtre
     for k in NEGATIF:
         if k in metin:
             return False
+
+    # 3. Pozitif filtre
     for k in POZITIF:
         if k in metin:
             return True
-    # KAP'tan gelen haber ama pozitif kelime yoksa da tara
+
+    # 4. KAP + büyük rakam kombinasyonu
     if "kap" in metin and any(k in metin for k in ["milyon", "milyar", "usd", "eur"]):
         return True
+
     return False
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -277,12 +300,13 @@ def main():
         hid    = h.get("id", "")
         baslik = h.get("baslik", "")
         kaynak = h.get("sirket", "")
+        tarih  = h.get("zaman", "")
 
         if not baslik or hid in gorulmus:
             continue
         gorulmus.add(hid)
 
-        if not on_filtre(baslik):
+        if not on_filtre(baslik, tarih):
             continue
 
         log.info(f"Aday: {baslik[:70]}")
@@ -293,7 +317,7 @@ def main():
         if skor >= KATALIZ_ESIK:
             sinyal = {
                 "id": hid,
-                "zaman": h.get("zaman", ""),
+                "zaman": tarih,
                 "tarama_zamani": datetime.utcnow().isoformat() + "Z",
                 "sirket": kaynak,
                 "kod": "",

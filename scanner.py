@@ -1,8 +1,7 @@
 """
 scanner.py — GitHub Actions'ta çalışan KAP tarayıcı
 Kaynak: finans.mynet.com/borsa/kaphaberleri/
-Hisse kodu (***KDMR***) ile birlikte KAP bildirimlerini çeker.
-48 saatten eski haberler otomatik elenir.
+Filtreden geçen adaylar için detay sayfası fetch edilir, tam metin skorlanır.
 """
 
 import os
@@ -11,8 +10,8 @@ import hashlib
 import logging
 import requests
 import re
+import time
 from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
 from bs4 import BeautifulSoup
 
 try:
@@ -45,22 +44,38 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-POZITIF = [
-    "sözleşme", "sozlesme", "anlaşma", "anlasma", "mukavele",
-    "sipariş", "siparis", "ihracat", "ihraç", "tedarik",
-    "ortaklık", "ortaklik", "işbirliği", "isbirligi",
-    "joint venture", "konsorsiyum", "ihale kazandı", "ihaleyi kazandı",
-    "satış sözleşmesi", "lisans anlaşması", "yurt dışı sipariş",
-    "özel durum açıklaması", "özel durum (genel)",
-    "önemli sözleşme", "önemli anlaşma",
+# Bildirim tipleri — direkt elenenler
+NEGATIF_TIPLER = [
+    "finansal rapor", "faaliyet raporu", "sorumluluk beyanı",
+    "kurumsal yönetim", "sürdürülebilirlik", "katılım finansı",
+    "bağımsız denetim", "piyasa yapıcılığı", "sermaye artırımından",
+    "temettü", "genel kurul", "bilgi formu", "uyum raporu",
 ]
-NEGATIF = [
-    "faaliyet raporu", "bilanço", "bilanco", "genel kurul",
-    "temettü", "temettu", "bağımsız denetim",
-    "sermaye artırımı", "hisse geri alım", "finansal rapor",
-    "sorumluluk beyanı", "kurumsal yönetim", "sürdürülebilirlik",
-    "piyasa yapıcılığı", "katılım finansı bilgi formu",
+
+# Bildirim tipleri — detay sayfası fetch edilecekler
+POZITIF_TIPLER = [
+    "özel durum", "önemli sözleşme", "önemli anlaşma",
+    "ihracat", "satış", "sipariş",
 ]
+
+# İçerik anahtar kelimeleri
+KATALIZ_KELIMELER = {
+    "milyon": 15, "milyar": 25, "usd": 10, "eur": 10, "dolar": 8,
+    "yurt dışı": 12, "uluslararası": 8, "ihracat": 10,
+    "uzun vadeli": 8, "çok yıllık": 10, "münhasır": 12,
+    "ihale kazandı": 22, "ihaleyi kazandı": 22,
+    "büyük sipariş": 18, "dev anlaşma": 20,
+    "sipariş aldı": 18, "sözleşme imzalandı": 18,
+    "anlaşma sağlandı": 15, "tedarik anlaşması": 14,
+    "satış sözleşmesi": 14, "lisans anlaşması": 12,
+    "ortaklık anlaşması": 12, "joint venture": 12,
+    "konsorsiyum": 10, "ihale": 8,
+}
+NEGATIF_KELIMELER = {
+    "ön anlaşma": -15, "niyet mektubu": -12,
+    "mou": -10, "görüşme": -8, "değerlendirilmekte": -8,
+    "protokol imzalandı": -5,
+}
 
 def yukle_json(yol, varsayilan):
     try:
@@ -75,34 +90,29 @@ def kaydet_json(yol, veri):
         json.dump(veri, f, ensure_ascii=False, indent=2)
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Tarih Kontrolü
+#  Tarih
 # ─────────────────────────────────────────────────────────────────────────────
 
 AYLAR = {
     "Oca": 1, "Şub": 2, "Mar": 3, "Nis": 4, "May": 5, "Haz": 6,
     "Tem": 7, "Ağu": 8, "Eyl": 9, "Eki": 10, "Kas": 11, "Ara": 12,
-    "Jan": 1, "Feb": 2, "Apr": 4, "Jun": 6, "Jul": 7, "Aug": 8,
-    "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
 }
 
 def mynet_tarih_parse(tarih_str: str):
-    """'14 Şub 2026 09:37' → datetime"""
     try:
-        parcalar = tarih_str.strip().split()
-        if len(parcalar) == 4:
-            gun, ay_str, yil, saat = parcalar
-            ay = AYLAR.get(ay_str[:3], 0)
-            if ay == 0:
-                return None
-            saat_p = saat.split(":")
-            return datetime(int(yil), ay, int(gun),
-                          int(saat_p[0]), int(saat_p[1]),
-                          tzinfo=timezone.utc)
+        m = re.search(
+            r"(\d{1,2})\s+(Oca|Şub|Mar|Nis|May|Haz|Tem|Ağu|Eyl|Eki|Kas|Ara)\s+(\d{4})\s+(\d{2}):(\d{2})",
+            tarih_str
+        )
+        if m:
+            gun, ay_str, yil, saat, dakika = m.groups()
+            return datetime(int(yil), AYLAR[ay_str], int(gun),
+                            int(saat), int(dakika), tzinfo=timezone.utc)
     except:
-        return None
+        pass
+    return None
 
 def haber_taze_mi(tarih_str: str) -> bool:
-    """48 saatten yeni mi?"""
     if not tarih_str:
         return True
     dt = mynet_tarih_parse(tarih_str)
@@ -110,12 +120,12 @@ def haber_taze_mi(tarih_str: str) -> bool:
         return True
     fark_saat = (datetime.now(timezone.utc) - dt).total_seconds() / 3600
     if fark_saat > MAX_HABER_YAS_SAAT:
-        log.info(f"  ⏭ Eski haber atlandı ({int(fark_saat)} saat önce)")
+        log.info(f"  ⏭ Eski haber ({int(fark_saat)}sa)")
         return False
     return True
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Mynet KAP Haberleri
+#  Mynet KAP Listesi
 # ─────────────────────────────────────────────────────────────────────────────
 
 def mynet_kap_cek() -> list:
@@ -124,56 +134,54 @@ def mynet_kap_cek() -> list:
     try:
         r = requests.get(url, headers=HEADERS, timeout=20)
         log.info(f"Mynet KAP status: {r.status_code}, uzunluk: {len(r.text)}")
-
         soup = BeautifulSoup(r.text, "html.parser")
-
-        # Tüm haber linklerini bul
-        # Format: ***HISSE*** ŞİRKET ADI (bildirim tipi) → link text ve href
         linkler = soup.find_all("a", href=re.compile(r"/borsa/haberdetay/"))
-
         log.info(f"Bulunan KAP haberi linki: {len(linkler)}")
 
         for link in linkler:
             metin = link.get_text(strip=True)
-            if not metin or "***" not in metin:
+            if not metin or len(metin) < 10:
                 continue
 
             href = link.get("href", "")
             tam_url = f"https://finans.mynet.com{href}" if href.startswith("/") else href
 
-            # Hisse kodu çıkar: ***KDMR***
-            kod_match = re.search(r"\*\*\*([A-Z0-9]+)\*\*\*", metin)
+            # Hisse kodu: ***KDMR***
+            kod_match = re.search(r"\*\*\*([A-Z0-9]{2,8})\*\*\*", metin)
             hisse_kodu = kod_match.group(1) if kod_match else ""
 
-            # Bildirim tipi çıkar: (Özel Durum Açıklaması)
+            # Birden fazla *** varsa ilkini al
+            if not hisse_kodu:
+                continue
+
+            # Bildirim tipi: sonundaki parantez
             tip_match = re.search(r"\(([^)]+)\)\s*$", metin)
-            bildirim_tipi = tip_match.group(1) if tip_match else ""
+            bildirim_tipi = tip_match.group(1).strip() if tip_match else ""
 
-            # Şirket adını çıkar: ***KDMR*** KARDEMİR... (bildirim) → şirket adı
-            sirket_adi = re.sub(r"\*\*\*[A-Z0-9]+\*\*\*\s*", "", metin)
-            sirket_adi = re.sub(r"\s*\([^)]+\)\s*$", "", sirket_adi).strip()
+            # Şirket adı
+            sirket = re.sub(r"\*\*\*[A-Z0-9]+\*\*\*\s*", "", metin)
+            sirket = re.sub(r"\s*\([^)]+\)\s*$", "", sirket).strip()
+            sirket = re.sub(r"\s+", " ", sirket)
 
-            # Tarih: genellikle li veya parent elementinde
+            # Tarih: üst elementden
             tarih_str = ""
-            parent = link.parent
-            if parent:
-                tarih_match = re.search(
-                    r"\d{1,2}\s+(?:Oca|Şub|Mar|Nis|May|Haz|Tem|Ağu|Eyl|Eki|Kas|Ara)\s+\d{4}\s+\d{2}:\d{2}",
-                    parent.get_text()
-                )
-                if tarih_match:
-                    tarih_str = tarih_match.group(0)
+            for parent in [link.parent, link.parent.parent if link.parent else None]:
+                if parent:
+                    t = re.search(
+                        r"\d{1,2}\s+(?:Oca|Şub|Mar|Nis|May|Haz|Tem|Ağu|Eyl|Eki|Kas|Ara)\s+\d{4}\s+\d{2}:\d{2}",
+                        parent.get_text()
+                    )
+                    if t:
+                        tarih_str = t.group(0)
+                        break
 
             hid = hashlib.md5(tam_url.encode("utf-8")).hexdigest()[:12]
-
             haberler.append({
-                "id":              hid,
-                "baslik":          metin.strip(),
-                "sirket":          sirket_adi,
-                "kod":             hisse_kodu,
-                "bildirim_tipi":   bildirim_tipi,
-                "url":             tam_url,
-                "zaman":           tarih_str,
+                "id": hid, "baslik": metin.strip(),
+                "sirket": sirket, "kod": hisse_kodu,
+                "bildirim_tipi": bildirim_tipi,
+                "url": tam_url, "zaman": tarih_str,
+                "icerik": "",
             })
 
     except Exception as e:
@@ -182,42 +190,51 @@ def mynet_kap_cek() -> list:
     return haberler
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Detay Sayfası Fetch
+# ─────────────────────────────────────────────────────────────────────────────
+
+def detay_cek(url: str) -> str:
+    """Mynet haber detay sayfasından KAP bildirim metnini çeker."""
+    try:
+        time.sleep(0.5)  # rate limit
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        # Mynet detay sayfasında haber içeriği
+        icerik_div = (
+            soup.find("div", class_=re.compile(r"news-detail|haber-icerik|article|content", re.I))
+            or soup.find("article")
+            or soup.find("div", id=re.compile(r"content|icerik", re.I))
+        )
+
+        if icerik_div:
+            metin = icerik_div.get_text(separator=" ", strip=True)
+            return metin[:2000]
+
+        # Fallback: tüm p tagları
+        paragraflar = soup.find_all("p")
+        return " ".join(p.get_text(strip=True) for p in paragraflar[:10])[:2000]
+
+    except Exception as e:
+        log.warning(f"Detay fetch hatası ({url}): {e}")
+        return ""
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Filtre
 # ─────────────────────────────────────────────────────────────────────────────
 
-def on_filtre(baslik: str, zaman: str = "", bildirim_tipi: str = "") -> bool:
-    # 1. Tarih filtresi
+def on_filtre(bildirim_tipi: str, zaman: str = "") -> bool:
     if not haber_taze_mi(zaman):
         return False
 
-    metin = baslik.lower()
-    tip   = bildirim_tipi.lower()
+    tip = bildirim_tipi.lower()
 
-    # 2. Negatif bildirim tipleri — raporlar, kurumsal vs. direkt elensin
-    NEGATIF_TIPLER = [
-        "finansal rapor", "faaliyet raporu", "sorumluluk beyanı",
-        "kurumsal yönetim", "sürdürülebilirlik", "katılım finansı",
-        "bağımsız denetim", "piyasa yapıcılığı", "sermaye artırımı",
-        "temettü", "genel kurul",
-    ]
     for t in NEGATIF_TIPLER:
         if t in tip:
             return False
 
-    # 3. Güçlü pozitif tipler — doğrudan geçir
-    POZITIF_TIPLER = [
-        "özel durum", "önemli sözleşme", "önemli anlaşma",
-    ]
     for t in POZITIF_TIPLER:
         if t in tip:
-            return True
-
-    # 4. Metin tabanlı filtre
-    for k in NEGATIF:
-        if k in metin:
-            return False
-    for k in POZITIF:
-        if k in metin:
             return True
 
     return False
@@ -226,14 +243,13 @@ def on_filtre(baslik: str, zaman: str = "", bildirim_tipi: str = "") -> bool:
 #  Analiz
 # ─────────────────────────────────────────────────────────────────────────────
 
-GPT_SISTEM = """Sen bir BIST uzman analistisin. KAP bildirimleri analiz ederek
+GPT_SISTEM = """Sen bir BIST uzman analistisin. KAP bildirim içeriklerini analiz ederek
 kısa vadeli fiyat katalizi yaratabilecekleri 0-100 arasında skorluyorsun.
 SADECE JSON yanıt ver, başka metin ekleme."""
 
-GPT_PROMPT = """Hisse kodu: {kod}
-Şirket: {sirket}
-Bildirim başlığı: {baslik}
+GPT_PROMPT = """Hisse: {kod} — {sirket}
 Bildirim tipi: {bildirim_tipi}
+İçerik: {icerik}
 
 JSON formatı:
 {{
@@ -251,6 +267,7 @@ def gpt_analiz(h: dict) -> dict:
         return kural_analiz(h)
     try:
         client = OpenAI(api_key=OPENAI_API_KEY)
+        icerik = h.get("icerik", "") or h.get("baslik", "")
         resp = client.chat.completions.create(
             model="gpt-4o",
             messages=[
@@ -258,8 +275,8 @@ def gpt_analiz(h: dict) -> dict:
                 {"role": "user", "content": GPT_PROMPT.format(
                     kod=h.get("kod", ""),
                     sirket=h.get("sirket", ""),
-                    baslik=h.get("baslik", ""),
                     bildirim_tipi=h.get("bildirim_tipi", ""),
+                    icerik=icerik[:1500],
                 )},
             ],
             temperature=0.1,
@@ -273,36 +290,29 @@ def gpt_analiz(h: dict) -> dict:
         return kural_analiz(h)
 
 def kural_analiz(h: dict) -> dict:
-    metin = h.get("baslik", "").lower()
+    # Hem başlık hem içerik üzerinde skor
+    metin = (h.get("icerik", "") + " " + h.get("baslik", "")).lower()
     tip   = h.get("bildirim_tipi", "").lower()
-    skor  = 50
+    skor  = 45  # base
 
-    # Bildirim tipine göre baz skor
+    # Bildirim tipine göre baz
     if "özel durum" in tip:
         skor += 10
     if "önemli" in tip:
         skor += 15
 
-    for k, v in {
-        "milyon": 15, "milyar": 25, "usd": 10, "eur": 10, "dolar": 8,
-        "yurt dışı": 10, "uluslararası": 8, "uzun vadeli": 8,
-        "çok yıllık": 10, "münhasır": 12, "ihale kazandı": 20,
-        "büyük sipariş": 18, "dev anlaşma": 20, "ihracat": 8,
-        "sipariş": 12, "sözleşme": 10, "anlaşma": 10,
-    }.items():
+    for k, v in KATALIZ_KELIMELER.items():
         if k in metin:
             skor += v
 
-    for k, v in {
-        "ön anlaşma": -15, "niyet mektubu": -12,
-        "mou": -12, "görüşme": -10, "değerlendirilmekte": -8,
-    }.items():
+    for k, v in NEGATIF_KELIMELER.items():
         if k in metin:
             skor += v
 
+    ozet = h.get("icerik", h.get("baslik", ""))[:150]
     return {
         "kataliz_skoru": max(0, min(100, skor)),
-        "ozet": h.get("baslik", "")[:120],
+        "ozet": ozet,
         "anlasma_buyuklugu": "Belirtilmemiş",
         "tekrarlayan": "Belirsiz",
         "karsi_taraf": "Bilinmiyor",
@@ -316,7 +326,6 @@ def kural_analiz(h: dict) -> dict:
 
 def telegram_gonder(mesaj: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.info(f"[Telegram yok] {mesaj[:80]}")
         return
     try:
         requests.post(
@@ -334,13 +343,11 @@ def telegram_gonder(mesaj: str):
         log.error(f"Telegram hatası: {e}")
 
 def sinyal_mesaji(h: dict) -> str:
-    emoji = "🔴" if h["skor"] >= 85 else "🟡" if h["skor"] >= 70 else "⚪"
-    kod_str = f" `{h['kod']}`" if h.get("kod") else ""
+    emoji = "🔴" if h["skor"] >= 85 else "🟡"
     return (
-        f"{emoji} *KATALİZ SİNYALİ*{kod_str}\n\n"
+        f"{emoji} *KATALİZ SİNYALİ* `{h.get('kod','')}`\n\n"
         f"🏢 {h.get('sirket', '')}\n"
-        f"📋 {h.get('bildirim_tipi', '')}\n"
-        f"📰 {h['baslik'][:200]}\n\n"
+        f"📋 {h.get('bildirim_tipi', '')}\n\n"
         f"🎯 Skor: *{h['skor']}/100*\n"
         f"💡 {h['ozet']}\n"
         f"📊 Büyüklük: {h['anlasma_buyuklugu']}\n"
@@ -364,52 +371,59 @@ def main():
 
     haberler    = mynet_kap_cek()
     yeni_sinyal = 0
-
-    log.info(f"Toplam çekilen bildirim: {len(haberler)}")
+    aday_sayisi = 0
 
     for h in haberler:
-        hid    = h.get("id", "")
-        baslik = h.get("baslik", "")
-
-        if not baslik or hid in gorulmus:
+        hid = h.get("id", "")
+        if not hid or hid in gorulmus:
             continue
         gorulmus.add(hid)
 
-        if not on_filtre(baslik, h.get("zaman", ""), h.get("bildirim_tipi", "")):
+        if not on_filtre(h.get("bildirim_tipi", ""), h.get("zaman", "")):
             continue
 
-        log.info(f"Aday: [{h.get('kod','')}] {baslik[:60]}")
+        aday_sayisi += 1
+        log.info(f"Aday [{h.get('kod','')}]: {h.get('bildirim_tipi','')} — {h.get('sirket','')[:40]}")
+
+        # Detay sayfasını çek
+        icerik = detay_cek(h["url"])
+        h["icerik"] = icerik
+        log.info(f"  Detay: {len(icerik)} karakter")
+
         analiz = gpt_analiz(h)
         skor   = analiz.get("kataliz_skoru", 0)
         log.info(f"  → Skor: {skor}")
 
         if skor >= KATALIZ_ESIK:
             sinyal = {
-                "id":              hid,
-                "zaman":           h.get("zaman", ""),
-                "tarama_zamani":   datetime.utcnow().isoformat() + "Z",
-                "sirket":          h.get("sirket", ""),
-                "kod":             h.get("kod", ""),
-                "bildirim_tipi":   h.get("bildirim_tipi", ""),
-                "baslik":          baslik,
-                "skor":            skor,
-                "ozet":            analiz.get("ozet", ""),
+                "id": hid,
+                "zaman": h.get("zaman", ""),
+                "tarama_zamani": datetime.utcnow().isoformat() + "Z",
+                "sirket": h.get("sirket", ""),
+                "kod": h.get("kod", ""),
+                "bildirim_tipi": h.get("bildirim_tipi", ""),
+                "baslik": h.get("baslik", ""),
+                "skor": skor,
+                "ozet": analiz.get("ozet", ""),
                 "anlasma_buyuklugu": analiz.get("anlasma_buyuklugu", ""),
-                "tekrarlayan":     analiz.get("tekrarlayan", ""),
-                "karsi_taraf":     analiz.get("karsi_taraf", ""),
-                "kataliz_tipi":    analiz.get("kataliz_tipi", ""),
-                "risk":            analiz.get("risk", ""),
-                "url":             h.get("url", ""),
+                "tekrarlayan": analiz.get("tekrarlayan", ""),
+                "karsi_taraf": analiz.get("karsi_taraf", ""),
+                "kataliz_tipi": analiz.get("kataliz_tipi", ""),
+                "risk": analiz.get("risk", ""),
+                "url": h.get("url", ""),
             }
             sinyaller.insert(0, sinyal)
             telegram_gonder(sinyal_mesaji(sinyal))
             yeni_sinyal += 1
             log.info(f"  ✅ SİNYAL: [{h.get('kod','')}] Skor={skor}")
 
+    log.info(f"Aday sayısı: {aday_sayisi}, Yeni sinyal: {yeni_sinyal}")
+
     sinyaller  = sinyaller[:200]
     tarama_log.insert(0, {
-        "zaman":       datetime.utcnow().isoformat() + "Z",
-        "taranan":     len(haberler),
+        "zaman": datetime.utcnow().isoformat() + "Z",
+        "taranan": len(haberler),
+        "aday": aday_sayisi,
         "yeni_sinyal": yeni_sinyal,
     })
     tarama_log = tarama_log[:100]

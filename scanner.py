@@ -78,23 +78,38 @@ def kaydet_json(yol: str, veri):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def kap_ac(sayfa: int = 0) -> list:
-    url = "https://www.kap.org.tr/tr/api/disclosures"
+    urls = [
+        "https://www.kap.org.tr/tr/api/disclosures",
+        "https://www.kap.org.tr/en/api/disclosures",
+    ]
     headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; KAPRadar/1.0)",
-        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "tr-TR,tr;q=0.9",
         "Referer": "https://www.kap.org.tr/",
+        "X-Requested-With": "XMLHttpRequest",
     }
-    try:
-        r = requests.get(url, params={"page": sayfa}, headers=headers, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-        # KAP bazen liste, bazen dict içinde liste döner
-        if isinstance(data, list):
-            return data
-        return data.get("data", data.get("disclosures", []))
-    except Exception as e:
-        log.error(f"KAP erişim hatası: {e}")
-        return []
+    for url in urls:
+        try:
+            r = requests.get(
+                url,
+                params={"page": sayfa, "take": 20},
+                headers=headers,
+                timeout=20
+            )
+            r.raise_for_status()
+            log.info(f"KAP yanıtı: {r.status_code} — {url}")
+            log.info(f"İlk 200 karakter: {r.text[:200]}")
+            data = r.json()
+            if isinstance(data, list) and len(data) > 0:
+                return data
+            if isinstance(data, dict):
+                for key in ["data", "disclosures", "result", "items", "content"]:
+                    if key in data and isinstance(data[key], list):
+                        return data[key]
+        except Exception as e:
+            log.error(f"KAP erişim hatası ({url}): {e}")
+    return []
 
 def haber_detay_cek(disclosure_id: str) -> str:
     url = f"https://www.kap.org.tr/tr/Bildirim/{disclosure_id}"

@@ -1,14 +1,19 @@
 """
 scanner.py — GitHub Actions'ta çalışan KAP tarayıcı
-KAP API engellendiği için HTML sayfası scrape edilir.
+Google News RSS üzerinden KAP haberlerini takip eder.
+KAP'ın kendi sitesi GitHub IP'lerini engellediği için
+Google News RSS alternatif kaynak olarak kullanılır.
 """
 
 import os
 import json
+import hashlib
 import logging
 import requests
+import xml.etree.ElementTree as ET
 from datetime import datetime
-from bs4 import BeautifulSoup
+from html import unescape
+import re
 
 try:
     from openai import OpenAI
@@ -36,18 +41,23 @@ POZITIF = [
     "sözleşme", "sozlesme", "anlaşma", "anlasma", "mukavele",
     "sipariş", "siparis", "ihracat", "ihraç", "tedarik",
     "ortaklık", "ortaklik", "işbirliği", "isbirligi",
-    "joint venture", "konsorsiyum", "ihale kazanıldı",
+    "joint venture", "konsorsiyum", "ihale kazandı", "ihaleyi kazandı",
     "satış sözleşmesi", "lisans anlaşması", "yurt dışı sipariş",
+    "özel durum açıklaması", "ozel durum",
 ]
 NEGATIF = [
     "faaliyet raporu", "bilanço", "bilanco", "genel kurul",
     "temettü", "temettu", "bağımsız denetim", "yönetim kurulu üye",
-    "sermaye artırımı", "hisse geri alım",
+    "sermaye artırımı", "hisse geri alım", "finansal rapor",
 ]
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Yardımcı
-# ─────────────────────────────────────────────────────────────────────────────
+# Google News RSS sorgu listeleri — KAP haberleri için
+RSS_SORGULAR = [
+    "KAP+sözleşme+BIST",
+    "KAP+anlaşma+borsa",
+    "KAP+ihracat+sipariş+hisse",
+    "KAP+özel+durum+açıklaması",
+]
 
 def yukle_json(yol, varsayilan):
     try:
@@ -62,86 +72,65 @@ def kaydet_json(yol, veri):
         json.dump(veri, f, ensure_ascii=False, indent=2)
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  KAP HTML Scraper
+#  Google News RSS
 # ─────────────────────────────────────────────────────────────────────────────
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-}
-
-def kap_ac() -> list:
-    """KAP bildirimler sayfasını HTML olarak okur."""
-    url = "https://www.kap.org.tr/tr/Bildirimler/Genel"
+def google_news_cek(sorgu: str) -> list:
+    url = f"https://news.google.com/rss/search?q={sorgu}&hl=tr&gl=TR&ceid=TR:tr"
     haberler = []
-
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; FeedFetcher-Google)"
+    }
     try:
-        session = requests.Session()
-        # Önce ana sayfayı ziyaret et (cookie al)
-        session.get("https://www.kap.org.tr", headers=HEADERS, timeout=15)
+        r = requests.get(url, headers=headers, timeout=15)
+        log.info(f"RSS sorgu '{sorgu}': status={r.status_code}, uzunluk={len(r.text)}")
 
-        r = session.get(url, headers=HEADERS, timeout=20)
-        log.info(f"KAP HTML status: {r.status_code}")
-        log.info(f"İçerik uzunluğu: {len(r.text)} karakter")
+        root = ET.fromstring(r.content)
+        items = root.findall(".//item")
+        log.info(f"  → {len(items)} haber bulundu")
 
-        soup = BeautifulSoup(r.text, "html.parser")
+        for item in items:
+            baslik = item.findtext("title") or ""
+            link   = item.findtext("link") or ""
+            tarih  = item.findtext("pubDate") or ""
+            kaynak = item.findtext("source") or ""
 
-        # KAP bildirim satırlarını bul
-        # Farklı CSS sınıflarını dene
-        satirlar = (
-            soup.find_all("tr", class_=lambda c: c and "disclosure" in str(c).lower())
-            or soup.find_all("div", class_=lambda c: c and "disclosure" in str(c).lower())
-            or soup.select("table.w-100 tr")
-            or soup.select(".disclosureList tr")
-            or soup.find_all("tr")[1:]  # Tablo varsa başlığı atla
-        )
+            # HTML taglarını temizle
+            baslik = unescape(re.sub(r'<[^>]+>', '', baslik))
 
-        log.info(f"Bulunan satır sayısı: {len(satirlar)}")
+            # Benzersiz ID üret
+            hid = hashlib.md5(link.encode("utf-8")).hexdigest()[:12]
 
-        for satir in satirlar[:50]:
-            hucre = satir.find_all("td")
-            if len(hucre) < 3:
-                continue
+            haberler.append({
+                "id":     hid,
+                "baslik": baslik.strip(),
+                "url":    link,
+                "zaman":  tarih,
+                "sirket": kaynak,
+                "kod":    "",
+            })
 
-            metinler = [h.get_text(strip=True) for h in hucre]
-            log.info(f"Satır: {metinler[:4]}")
-
-            # KAP tablo yapısı genellikle: tarih | şirket | başlık | ...
-            haber = {
-                "id": "",
-                "zaman": metinler[0] if len(metinler) > 0 else "",
-                "sirket": metinler[1] if len(metinler) > 1 else "",
-                "kod": "",
-                "baslik": metinler[2] if len(metinler) > 2 else "",
-            }
-
-            # Link varsa ID'yi al
-            link = satir.find("a", href=True)
-            if link:
-                href = link.get("href", "")
-                # /tr/Bildirim/12345 formatından ID çek
-                parcalar = href.rstrip("/").split("/")
-                if parcalar:
-                    haber["id"] = parcalar[-1]
-                if not haber["baslik"]:
-                    haber["baslik"] = link.get_text(strip=True)
-
-            if haber["baslik"] and len(haber["baslik"]) > 5:
-                haberler.append(haber)
-
+    except ET.ParseError as e:
+        log.error(f"RSS parse hatası ({sorgu}): {e}")
     except Exception as e:
-        log.error(f"KAP scrape hatası: {e}")
+        log.error(f"RSS hatası ({sorgu}): {e}")
 
-    log.info(f"Toplam çekilen haber: {len(haberler)}")
     return haberler
+
+def tum_haberleri_cek() -> list:
+    tum = []
+    gorulmus_basliklar = set()
+
+    for sorgu in RSS_SORGULAR:
+        haberler = google_news_cek(sorgu)
+        for h in haberler:
+            # Duplicate başlık kontrolü
+            if h["baslik"] not in gorulmus_basliklar:
+                gorulmus_basliklar.add(h["baslik"])
+                tum.append(h)
+
+    log.info(f"Toplam benzersiz haber: {len(tum)}")
+    return tum
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Filtre
@@ -155,18 +144,21 @@ def on_filtre(baslik: str) -> bool:
     for k in POZITIF:
         if k in metin:
             return True
+    # KAP'tan gelen haber ama pozitif kelime yoksa da tara
+    if "kap" in metin and any(k in metin for k in ["milyon", "milyar", "usd", "eur"]):
+        return True
     return False
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Analiz
 # ─────────────────────────────────────────────────────────────────────────────
 
-GPT_SISTEM = """Sen bir BIST uzman analistisin. KAP açıklamalarını analiz ederek
+GPT_SISTEM = """Sen bir BIST uzman analistisin. Haber başlıklarını analiz ederek
 kısa vadeli fiyat katalizi yaratabilecek haberleri 0-100 arasında skorluyorsun.
 SADECE JSON yanıt ver, başka metin ekleme."""
 
-GPT_PROMPT = """Şirket: {sirket} ({kod})
-Başlık: {baslik}
+GPT_PROMPT = """Haber başlığı: {baslik}
+Kaynak: {kaynak}
 
 JSON formatı:
 {{
@@ -179,7 +171,7 @@ JSON formatı:
   "risk": "varsa belirt, yoksa Yok"
 }}"""
 
-def gpt_analiz(sirket, kod, baslik) -> dict:
+def gpt_analiz(baslik, kaynak="") -> dict:
     if not OPENAI_AVAILABLE or not OPENAI_API_KEY:
         return kural_analiz(baslik)
     try:
@@ -189,7 +181,7 @@ def gpt_analiz(sirket, kod, baslik) -> dict:
             messages=[
                 {"role": "system", "content": GPT_SISTEM},
                 {"role": "user", "content": GPT_PROMPT.format(
-                    sirket=sirket, kod=kod, baslik=baslik
+                    baslik=baslik, kaynak=kaynak
                 )},
             ],
             temperature=0.1,
@@ -205,19 +197,18 @@ def gpt_analiz(sirket, kod, baslik) -> dict:
 def kural_analiz(baslik: str) -> dict:
     metin = baslik.lower()
     skor = 50
-    artiranlar = {
+    for k, v in {
         "milyon": 15, "milyar": 25, "usd": 10, "eur": 10,
         "yurt dışı": 10, "uluslararası": 8, "uzun vadeli": 8,
-        "çok yıllık": 10, "münhasır": 12
-    }
-    dusururenler = {
-        "ön anlaşma": -15, "niyet mektubu": -12,
-        "mou": -12, "görüşme": -10, "değerlendirilmekte": -8
-    }
-    for k, v in artiranlar.items():
+        "çok yıllık": 10, "münhasır": 12, "ihale kazandı": 20,
+        "büyük sipariş": 18, "dev anlaşma": 20,
+    }.items():
         if k in metin:
             skor += v
-    for k, v in dusururenler.items():
+    for k, v in {
+        "ön anlaşma": -15, "niyet mektubu": -12,
+        "mou": -12, "görüşme": -10, "değerlendirilmekte": -8,
+    }.items():
         if k in metin:
             skor += v
     return {
@@ -254,10 +245,9 @@ def telegram_gonder(mesaj: str):
         log.error(f"Telegram hatası: {e}")
 
 def sinyal_mesaji(h: dict) -> str:
-    skor_emoji = "🔴" if h["skor"] >= 85 else "🟡" if h["skor"] >= 70 else "⚪"
+    emoji = "🔴" if h["skor"] >= 85 else "🟡" if h["skor"] >= 70 else "⚪"
     return (
-        f"{skor_emoji} *KATALİZ SİNYALİ*\n\n"
-        f"🏢 *{h['sirket']}* (`{h['kod']}`)\n"
+        f"{emoji} *KATALİZ SİNYALİ*\n\n"
         f"📰 {h['baslik']}\n\n"
         f"🎯 Skor: *{h['skor']}/100*\n"
         f"💡 {h['ozet']}\n"
@@ -266,7 +256,7 @@ def sinyal_mesaji(h: dict) -> str:
         f"🔄 Tekrarlayan: {h['tekrarlayan']}\n\n"
         f"⚡ Hedef: +{HEDEF_GETIRI}%  |  Stop: -{STOP_LOSS}%  |  Max {MAX_SURE_SAAT}sa\n"
         f"🕐 {h['zaman']}\n"
-        f"🔗 https://www.kap.org.tr/tr/Bildirim/{h['id']}"
+        f"🔗 {h['url']}"
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -280,65 +270,52 @@ def main():
     sinyaller  = yukle_json(SIGNALS_FILE, [])
     tarama_log = yukle_json(SCANLOG_FILE, [])
 
-    haberler = kap_ac()
-    log.info(f"{len(haberler)} açıklama işlenecek")
-
+    haberler    = tum_haberleri_cek()
     yeni_sinyal = 0
 
     for h in haberler:
-        hid    = str(h.get("id", ""))
+        hid    = h.get("id", "")
         baslik = h.get("baslik", "")
-        sirket = h.get("sirket", "")
-        kod    = h.get("kod", "")
-        zaman  = h.get("zaman", "")
+        kaynak = h.get("sirket", "")
 
-        if not baslik:
+        if not baslik or hid in gorulmus:
             continue
-
-        # ID yoksa başlıktan üret
-        if not hid:
-            import hashlib
-            hid = hashlib.md5(baslik.encode()).hexdigest()[:12]
-
-        if hid in gorulmus:
-            continue
-
         gorulmus.add(hid)
 
         if not on_filtre(baslik):
             continue
 
-        log.info(f"Aday: [{kod}] {baslik[:60]}")
-        analiz = gpt_analiz(sirket, kod, baslik)
+        log.info(f"Aday: {baslik[:70]}")
+        analiz = gpt_analiz(baslik, kaynak)
         skor   = analiz.get("kataliz_skoru", 0)
         log.info(f"  → Skor: {skor}")
 
         if skor >= KATALIZ_ESIK:
             sinyal = {
-                "id":                hid,
-                "zaman":             zaman,
-                "tarama_zamani":     datetime.utcnow().isoformat() + "Z",
-                "sirket":            sirket,
-                "kod":               kod,
-                "baslik":            baslik,
-                "skor":              skor,
-                "ozet":              analiz.get("ozet", ""),
+                "id": hid,
+                "zaman": h.get("zaman", ""),
+                "tarama_zamani": datetime.utcnow().isoformat() + "Z",
+                "sirket": kaynak,
+                "kod": "",
+                "baslik": baslik,
+                "skor": skor,
+                "ozet": analiz.get("ozet", ""),
                 "anlasma_buyuklugu": analiz.get("anlasma_buyuklugu", ""),
-                "tekrarlayan":       analiz.get("tekrarlayan", ""),
-                "karsi_taraf":       analiz.get("karsi_taraf", ""),
-                "kataliz_tipi":      analiz.get("kataliz_tipi", ""),
-                "risk":              analiz.get("risk", ""),
-                "url":               f"https://www.kap.org.tr/tr/Bildirim/{hid}",
+                "tekrarlayan": analiz.get("tekrarlayan", ""),
+                "karsi_taraf": analiz.get("karsi_taraf", ""),
+                "kataliz_tipi": analiz.get("kataliz_tipi", ""),
+                "risk": analiz.get("risk", ""),
+                "url": h.get("url", ""),
             }
             sinyaller.insert(0, sinyal)
             telegram_gonder(sinyal_mesaji(sinyal))
             yeni_sinyal += 1
-            log.info(f"  ✅ SİNYAL: [{kod}] Skor={skor}")
+            log.info(f"  ✅ SİNYAL: Skor={skor}")
 
     sinyaller  = sinyaller[:200]
     tarama_log.insert(0, {
-        "zaman":       datetime.utcnow().isoformat() + "Z",
-        "taranan":     len(haberler),
+        "zaman": datetime.utcnow().isoformat() + "Z",
+        "taranan": len(haberler),
         "yeni_sinyal": yeni_sinyal,
     })
     tarama_log = tarama_log[:100]
@@ -346,7 +323,6 @@ def main():
     kaydet_json(SIGNALS_FILE, sinyaller)
     kaydet_json(SCANLOG_FILE, tarama_log)
     kaydet_json(SEEN_FILE, list(gorulmus)[-2000:])
-
     log.info(f"═══ Tarama Bitti — {yeni_sinyal} yeni sinyal ═══")
 
 if __name__ == "__main__":

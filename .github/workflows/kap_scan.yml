@@ -1,0 +1,42 @@
+name: KAP Kataliz Tarayıcı
+
+on:
+  schedule:
+    # Her 15 dakikada bir çalışır (UTC — Türkiye UTC+3)
+    # Borsa saatleri: 10:00-18:00 TR = 07:00-15:00 UTC
+    - cron: "*/15 7-15 * * 1-5"   # Hafta içi borsa saatleri
+    - cron: "0 8 * * 1-5"          # Açılış öncesi erken tarama
+  workflow_dispatch:               # Manuel tetikleme (test için)
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write              # signals.json güncellemesi için
+
+    steps:
+      - name: Repo'yu çek
+        uses: actions/checkout@v4
+
+      - name: Python kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Bağımlılıkları yükle
+        run: pip install requests beautifulsoup4 openai
+
+      - name: KAP taramasını çalıştır
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scanner.py
+
+      - name: Sinyal dosyasını commit'le
+        run: |
+          git config user.name  "kap-radar-bot"
+          git config user.email "bot@kap-radar"
+          git add data/signals.json data/scan_log.json
+          git diff --staged --quiet || git commit -m "🔍 Tarama güncellendi $(date -u '+%Y-%m-%d %H:%M') UTC"
+          git push
